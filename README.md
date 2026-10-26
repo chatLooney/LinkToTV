@@ -6,7 +6,7 @@ No app on the phone, no account, no cloud.</p>
 
 | TV screen | iPhone page |
 |---|---|
-| ![TV screen](docs/tv-screen.jpg) | ![iPhone page](docs/iphone-page.png) |
+| ![TV screen](docs/tv-screen.png) | ![iPhone page](docs/iphone-page.png) |
 
 ## Features
 - **Nothing to install on the phone.** The TV hosts a small web page. Scan the QR code and send.
