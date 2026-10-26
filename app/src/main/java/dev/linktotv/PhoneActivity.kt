@@ -37,6 +37,11 @@ class PhoneActivity : Activity() {
 
     override fun onCreate(b: Bundle?) {
         super.onCreate(b)
+        // On a TV, this launcher entry must open the receiver screen instead of the phone sender.
+        val tvMode = packageManager.hasSystemFeature("android.software.leanback") ||
+            (getSystemService(UI_MODE_SERVICE) as android.app.UiModeManager).currentModeType ==
+            android.content.res.Configuration.UI_MODE_TYPE_TELEVISION
+        if (tvMode) { startActivity(Intent(this, TvActivity::class.java)); finish(); return }
         val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(48, 96, 48, 48) }
         link = EditText(this).apply { hint = "Paste a video link"; inputType = InputType.TYPE_TEXT_VARIATION_URI }
         spin = Spinner(this); status = TextView(this).apply { text = "Looking for TVs on your Wi-Fi…" }

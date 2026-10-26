@@ -12,6 +12,8 @@ import org.json.JSONArray
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.io.File
+import android.webkit.MimeTypeMap
 import java.util.UUID
 
 const val SERVICE_TYPE = "_linktotv._tcp."
@@ -75,6 +77,15 @@ object Store {
         for (i in 0 until old.length()) { val o = old.getJSONObject(i); if (o.getString("url") != url && n.length() < 20) n.put(o) }
         saveLib(c, l.put("history", n))
     }
+    fun queue(c: Context): JSONArray = library(c).optJSONArray("queue") ?: JSONArray()
+    private fun setQueue(c: Context, a: JSONArray) = saveLib(c, library(c).put("queue", a))
+    fun queueAdd(c: Context, url: String) = setQueue(c, queue(c).put(url))
+    fun queueClear(c: Context) = setQueue(c, JSONArray())
+    fun queueRemove(c: Context, url: String) {
+        val q = queue(c); val n = JSONArray(); var done = false
+        for (i in 0 until q.length()) if (!done && q.getString(i) == url) done = true else n.put(q.getString(i))
+        setQueue(c, n)
+    }
     fun toggleFav(c: Context, url: String) {
         val l = library(c); val f = l.getJSONArray("favs"); val n = JSONArray(); var found = false
         for (i in 0 until f.length()) if (f.getString(i) == url) found = true else n.put(f.getString(i))
@@ -91,17 +102,32 @@ class Server(private val c: Context) : NanoHTTPD(PORT) {
     private fun deviceName(ua: String?) = when {
         ua == null -> "Browser"; ua.contains("iPhone") -> "iPhone"; ua.contains("iPad") -> "iPad"
         ua.contains("Android") -> "Android"; else -> "Browser" }
+    private fun uploads() = File(c.cacheDir, "uploads").apply { mkdirs() }
 
     override fun serve(s: IHTTPSession): Response {
-        val tok = s.headers["x-token"]
-        if (s.uri == "/" && s.method == Method.GET) return newFixedLengthResponse(Response.Status.OK, "text/html", PAGE)
+        val tok = s.headers["x-token"]; val get = s.method == Method.GET
+        if (get && s.uri == "/") return newFixedLengthResponse(Response.Status.OK, "text/html", PAGE)
         if (s.uri == "/info") return resp(200, """{"app":"linktotv"}""")
-        if (s.uri == "/library" && s.method == Method.GET)
+        if (get && s.uri == "/library")
             return if (Store.valid(c, tok)) resp(200, Store.library(c).toString()) else resp(401, "{}")
+        if (get && s.uri == "/queue.m3u") {
+            val q = Store.queue(c)
+            return newFixedLengthResponse(Response.Status.OK, "audio/x-mpegurl",
+                "#EXTM3U\n" + (0 until q.length()).joinToString("\n") { q.getString(it) } + "\n")
+        }
+        if (get && s.uri.startsWith("/files/")) {
+            val id = s.uri.removePrefix("/files/")
+            val f = File(uploads(), id)
+            if (!Regex("^[A-Za-z0-9]{8}(\\.[a-z0-9]{1,5})?$").matches(id) || !f.isFile) return resp(404, "{}")
+            val mime = MimeTypeMap.getSingleton().getMimeTypeFromExtension(f.extension) ?: "application/octet-stream"
+            return newFixedLengthResponse(Response.Status.OK, mime, f.inputStream(), f.length())
+        }
         if (s.method != Method.POST) return resp(405, "{}")
-        try { s.parseBody(HashMap()) } catch (e: Exception) { return resp(400, "{}") }
+        val files = HashMap<String, String>()
+        try { s.parseBody(files) } catch (e: Exception) { return resp(400, "{}") }
         val p = s.parms; val u = p["url"] ?: ""
         val okUrl = Regex("^https?://\\S+$").matches(u)
+        val authed = Store.valid(c, tok)
         return when (s.uri) {
             "/pair" -> if (p["code"] == ReceiverService.code) {
                 val t = Store.addDevice(c, deviceName(s.headers["user-agent"]))
@@ -111,24 +137,47 @@ class Server(private val c: Context) : NanoHTTPD(PORT) {
                 if (++fails >= 5) { ReceiverService.code = ReceiverService.newCode(); fails = 0 }
                 resp(403, "{}")
             }
-            "/play" -> when {
-                !Store.valid(c, tok) -> resp(401, "{}")
+            "/play", "/fav", "/queue/add", "/queue/remove" -> when {
+                !authed -> resp(401, "{}")
                 !okUrl -> resp(400, "{}")
-                else -> { Store.addHistory(c, u); Handler(Looper.getMainLooper()).post { open(u) }; resp(200, "{}") }
+                else -> {
+                    when (s.uri) {
+                        "/play" -> { Store.addHistory(c, u); Handler(Looper.getMainLooper()).post { open(u) } }
+                        "/fav" -> Store.toggleFav(c, u)
+                        "/queue/add" -> Store.queueAdd(c, u)
+                        else -> Store.queueRemove(c, u)
+                    }
+                    resp(200, "{}")
+                }
             }
-            "/fav" -> when {
-                !Store.valid(c, tok) -> resp(401, "{}")
-                !okUrl -> resp(400, "{}")
-                else -> { Store.toggleFav(c, u); resp(200, "{}") }
+            "/queue/clear" -> if (!authed) resp(401, "{}") else { Store.queueClear(c); resp(200, "{}") }
+            "/queue/play" -> when {
+                !authed -> resp(401, "{}")
+                Store.queue(c).length() == 0 -> resp(400, "{}")
+                else -> { Handler(Looper.getMainLooper()).post { open("http://127.0.0.1:$PORT/queue.m3u", null) }; resp(200, "{}") }
+            }
+            "/upload" -> {
+                val tmp = files["file"]; val orig = p["file"]
+                if (!authed) resp(401, "{}") else if (tmp == null || orig == null) resp(400, "{}") else {
+                    val ext = orig.substringAfterLast('.', "").lowercase().filter { it.isLetterOrDigit() }.take(5)
+                    val id = UUID.randomUUID().toString().replace("-", "").take(8) + (if (ext.isEmpty()) "" else ".$ext")
+                    File(tmp).copyTo(File(uploads(), id), true)
+                    uploads().listFiles()?.sortedByDescending { it.lastModified() }?.drop(3)?.forEach { it.delete() }
+                    val mime = MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext) ?: "video/*"
+                    Handler(Looper.getMainLooper()).post { open("http://127.0.0.1:$PORT/files/$id", mime) }
+                    resp(200, "{}")
+                }
             }
             else -> resp(404, "{}")
         }
     }
 
-    /** Hands the link to VLC if installed, otherwise to any app that can play it. */
-    private fun open(url: String) {
-        val i = Intent(Intent.ACTION_VIEW).setDataAndType(Uri.parse(url), "video/*").addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-        try { c.packageManager.getPackageInfo("org.videolan.vlc", 0); i.setPackage("org.videolan.vlc") } catch (e: Exception) {}
+    /** Hands the link to VLC if installed (images go to the default viewer), otherwise to any app that can play it. */
+    private fun open(url: String, type: String? = "video/*") {
+        val i = Intent(Intent.ACTION_VIEW).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        if (type == null) i.data = Uri.parse(url) else i.setDataAndType(Uri.parse(url), type)
+        if (type?.startsWith("image/") != true)
+            try { c.packageManager.getPackageInfo("org.videolan.vlc", 0); i.setPackage("org.videolan.vlc") } catch (e: Exception) {}
         try { c.startActivity(i) } catch (e: ActivityNotFoundException) {}
     }
 }
